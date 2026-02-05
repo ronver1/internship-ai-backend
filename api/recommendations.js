@@ -1,4 +1,13 @@
+// api/recommendations.js
 import OpenAI from "openai";
+
+/**
+ * REQUIRED ENV VARS (Vercel -> Project -> Settings -> Environment Variables)
+ * - OPENAI_API_KEY
+ *
+ * OPTIONAL:
+ * - LICENSE_SECRET   (comma-separated allowlist: "KEY1,KEY2")
+ */
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -18,9 +27,56 @@ export async function OPTIONS() {
   return json({ ok: true }, 200);
 }
 
-function validateEnv_() {
+/**
+ * WRAPPED SCHEMA (your style)
+ * OpenAI expects:
+ *   text.format.name   -> schema.name
+ *   text.format.schema -> schema.schema   (the inner raw JSON Schema)
+ */
+const schema = {
+  name: "internship_ai_recommendations",
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      summary: { type: "string" },
+      urgent_actions: { type: "array", items: { type: "string" } },
+      next_7_days_plan: { type: "array", items: { type: "string" } },
+      follow_ups: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            company: { type: "string" },
+            suggested_date: { type: "string" },
+            reason: { type: "string" },
+            message_draft: { type: "string" }
+          },
+          required: ["company", "suggested_date", "reason", "message_draft"]
+        }
+      },
+      recruiter_questions: { type: "array", items: { type: "string" } },
+      strategy_insights: { type: "array", items: { type: "string" } },
+      interview_prep: { type: "array", items: { type: "string" } },
+      risk_flags: { type: "array", items: { type: "string" } }
+    },
+    required: [
+      "summary",
+      "urgent_actions",
+      "next_7_days_plan",
+      "follow_ups",
+      "recruiter_questions",
+      "strategy_insights",
+      "interview_prep",
+      "risk_flags"
+    ]
+  }
+};
+
+function requireEnv_() {
   if (!process.env.OPENAI_API_KEY) {
-    throw new Error("Missing OPENAI_API_KEY environment variable in Vercel.");
+    throw new Error("Missing OPENAI_API_KEY in Vercel environment variables.");
   }
 }
 
@@ -28,10 +84,15 @@ function validateLicense_(request) {
   const secret = process.env.LICENSE_SECRET;
   if (!secret) return; // licensing disabled
 
-  const provided = request.headers.get("x-license-key") || "";
+  const provided = (request.headers.get("x-license-key") || "").trim();
+  if (!provided) throw new Error("Missing license key (x-license-key header).");
+
   const allow = secret.split(",").map(s => s.trim()).filter(Boolean);
-  if (!provided) throw new Error("Missing license key (x-license-key).");
   if (!allow.includes(provided)) throw new Error("Invalid license key.");
+}
+
+function safeString_(v, max = 500) {
+  return String(v ?? "").slice(0, max);
 }
 
 function normalizePayload_(payload) {
@@ -42,52 +103,38 @@ function normalizePayload_(payload) {
   return { apps, networking, interviews, meta };
 }
 
-function safeString_(v, max = 500) {
-  return String(v ?? "").slice(0, max);
+function toISODateString_(d) {
+  // Accepts Date objects or strings; returns string safely
+  if (!d) return "";
+  if (d instanceof Date && !isNaN(d.getTime())) return d.toISOString();
+  return String(d);
 }
 
 export async function POST(request) {
   try {
-    validateEnv_();
+    requireEnv_();
     validateLicense_(request);
 
     let payload;
     try {
       payload = await request.json();
-    } catch (e) {
+    } catch {
       return json({ error: "Request body must be valid JSON." }, 400);
     }
 
     const { apps, networking, interviews, meta } = normalizePayload_(payload);
     const ghostedDays = Number(meta?.ghosted_days_threshold ?? 14);
 
-    // Your wrapped schema object should look like:
-    // const schema = { name: "...", schema: { ...actual json schema... } }
-    // Ensure you have BOTH: schema.name and schema.schema
-    if (!globalThis.schema || !globalThis.schema.name || !globalThis.schema.schema) {
-      // If you defined schema as a local const, remove this block and just ensure it's defined below.
-      // This is only here to catch the most common crash: schema is undefined.
-    }
-
-    // ---- IMPORTANT: make sure "schema" exists in this file scope ----
-    // If your schema constant is named differently, update the next 3 lines accordingly.
-    const schemaName = schema?.name;
-    const innerSchema = schema?.schema;
-
-    if (!schemaName || !innerSchema) {
-      return json({ error: "Schema is missing. Ensure you have const schema = { name, schema }." }, 500);
-    }
-
-    // Slim + normalize inputs (prevents huge token usage)
+    // Slim down input so it stays fast/cheap and avoids token blowups
     const slimApps = apps.slice(0, 300).map(a => ({
       company: a["Company Name"] ?? a.company ?? "",
       role: a["Role Title"] ?? a.role ?? "",
       status: a["Status"] ?? a.status ?? "",
       priority: a["Priority"] ?? a.priority ?? "",
-      date_submitted: a["Date Submitted"] ?? a.date_submitted ?? "",
-      deadline: a["Deadline"] ?? a.deadline ?? "",
-      last_follow_up: a["Last Follow-Up Date"] ?? a.last_follow_up ?? "",
-      next_action: a["Next Action Date"] ?? a.next_action ?? "",
+      date_submitted: toISODateString_(a["Date Submitted"] ?? a.date_submitted ?? ""),
+      deadline: toISODateString_(a["Deadline"] ?? a.deadline ?? ""),
+      last_follow_up: toISODateString_(a["Last Follow-Up Date"] ?? a.last_follow_up ?? ""),
+      next_action: toISODateString_(a["Next Action Date"] ?? a.next_action ?? ""),
       recruiter: a["Recruiter Name"] ?? a.recruiter ?? "",
       recruiter_email: a["Recruiter Email"] ?? a.recruiter_email ?? "",
       notes: safeString_(a["Notes"] ?? a.notes, 500),
@@ -99,8 +146,8 @@ export async function POST(request) {
       contact: n["Contact Name"] ?? "",
       email: n["Email"] ?? "",
       where_met: n["Where Met"] ?? "",
-      last_contact: n["Last Contact Date"] ?? "",
-      next_follow_up: n["Next Follow-up Date"] ?? "",
+      last_contact: toISODateString_(n["Last Contact Date"] ?? ""),
+      next_follow_up: toISODateString_(n["Next Follow-up Date"] ?? ""),
       notes: safeString_(n["Notes"], 500)
     }));
 
@@ -108,7 +155,7 @@ export async function POST(request) {
       company: i["Company"] ?? "",
       role: i["Role"] ?? "",
       stage: i["Stage"] ?? "",
-      date: i["Date"] ?? "",
+      date: toISODateString_(i["Date"] ?? ""),
       format: i["Format"] ?? "",
       topics: safeString_(i["Topics"], 300),
       rating: i["Self Rating (1–5)"] ?? "",
@@ -118,20 +165,22 @@ export async function POST(request) {
 
     const system = `
 You are an internship application AI coach.
-Given applications, networking, and interviews, produce:
-- urgent actions (next 72 hours)
-- next 7 days plan
-- follow-ups with message drafts
-- recruiter questions
-- strategy insights
-- interview prep plan
-- risk flags
+
+Given a user's applications, networking, and interviews, produce:
+- urgent_actions (next 72 hours)
+- next_7_days_plan
+- follow_ups (each with a message draft)
+- recruiter_questions
+- strategy_insights
+- interview_prep
+- risk_flags
 
 Rules:
-- Be specific and time-oriented.
-- Prioritize High priority + Submitted + No follow-up.
-- Treat apps as ghosted if submitted > ${ghostedDays} days ago and no follow-up.
-Return ONLY JSON matching the schema.
+- Be specific and time-oriented (e.g., "today", "in 2 days", "this Friday").
+- Prioritize High priority + Submitted + No follow-up first.
+- Treat an application as "ghosted risk" if submitted > ${ghostedDays} days ago and no follow-up is recorded.
+- If key info is missing (recruiter email, submission date, etc.), add a risk_flag and suggest what to fill in.
+Return ONLY JSON that matches the schema exactly.
 `.trim();
 
     const user = {
@@ -150,25 +199,26 @@ Return ONLY JSON matching the schema.
       text: {
         format: {
           type: "json_schema",
-          name: schemaName,
-          schema: innerSchema,
+          name: schema.name,       // REQUIRED
+          schema: schema.schema,   // inner JSON schema only
           strict: true
         }
       }
     });
 
     const out = response.output_text;
+
     let parsed;
     try {
       parsed = JSON.parse(out);
-    } catch (e) {
-      // If the model ever returns non-JSON, return it for debugging
+    } catch {
+      // If model output ever isn't valid JSON, return it for debugging
       return json({ error: "Model returned non-JSON output.", raw: out }, 500);
     }
 
     return json(parsed, 200);
   } catch (err) {
-    // Ensure we ALWAYS return JSON (so Apps Script shows the real error)
-    return json({ error: err?.message ? String(err.message) : String(err) }, 500);
+    // Always return readable error JSON to Apps Script
+    return json({ error: String(err?.message || err) }, 500);
   }
 }
