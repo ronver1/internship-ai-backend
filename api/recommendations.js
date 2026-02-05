@@ -5,31 +5,36 @@ const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 function json(res, status = 200) {
   return new Response(JSON.stringify(res), {
     status,
-    headers: { "content-type": "application/json" }
+    headers: {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "POST, OPTIONS",
+      "access-control-allow-headers": "content-type, x-license-key"
+    }
   });
 }
 
-function requireEnv(name) {
-  if (!process.env[name]) throw new Error(`Missing env var: ${name}`);
+export async function OPTIONS() {
+  return json({ ok: true }, 200);
 }
 
-function validateLicense(request) {
-  // OPTIONAL: If you want licensing, set LICENSE_SECRET in Vercel
-  // and require client to send x-license-key.
+function validateEnv_() {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("Missing OPENAI_API_KEY environment variable in Vercel.");
+  }
+}
+
+function validateLicense_(request) {
   const secret = process.env.LICENSE_SECRET;
-  if (!secret) return { ok: true, mode: "no_license" };
+  if (!secret) return; // licensing disabled
 
   const provided = request.headers.get("x-license-key") || "";
-  if (!provided) return { ok: false, reason: "Missing license key." };
-
-  // simplest pattern: secret is a comma-separated allowlist
   const allow = secret.split(",").map(s => s.trim()).filter(Boolean);
-  if (!allow.includes(provided)) return { ok: false, reason: "Invalid license key." };
-
-  return { ok: true, mode: "license_ok" };
+  if (!provided) throw new Error("Missing license key (x-license-key).");
+  if (!allow.includes(provided)) throw new Error("Invalid license key.");
 }
 
-function normalizeInput(payload) {
+function normalizePayload_(payload) {
   const apps = payload?.data?.applications ?? [];
   const networking = payload?.data?.networking ?? [];
   const interviews = payload?.data?.interviews ?? [];
@@ -37,17 +42,43 @@ function normalizeInput(payload) {
   return { apps, networking, interviews, meta };
 }
 
+function safeString_(v, max = 500) {
+  return String(v ?? "").slice(0, max);
+}
+
 export async function POST(request) {
   try {
-    requireEnv("OPENAI_API_KEY");
+    validateEnv_();
+    validateLicense_(request);
 
-    const lic = validateLicense(request);
-    if (!lic.ok) return json({ error: lic.reason }, 401);
+    let payload;
+    try {
+      payload = await request.json();
+    } catch (e) {
+      return json({ error: "Request body must be valid JSON." }, 400);
+    }
 
-    const payload = await request.json();
-    const { apps, networking, interviews, meta } = normalizeInput(payload);
+    const { apps, networking, interviews, meta } = normalizePayload_(payload);
+    const ghostedDays = Number(meta?.ghosted_days_threshold ?? 14);
 
-    // Keep token usage reasonable: truncate very long notes fields.
+    // Your wrapped schema object should look like:
+    // const schema = { name: "...", schema: { ...actual json schema... } }
+    // Ensure you have BOTH: schema.name and schema.schema
+    if (!globalThis.schema || !globalThis.schema.name || !globalThis.schema.schema) {
+      // If you defined schema as a local const, remove this block and just ensure it's defined below.
+      // This is only here to catch the most common crash: schema is undefined.
+    }
+
+    // ---- IMPORTANT: make sure "schema" exists in this file scope ----
+    // If your schema constant is named differently, update the next 3 lines accordingly.
+    const schemaName = schema?.name;
+    const innerSchema = schema?.schema;
+
+    if (!schemaName || !innerSchema) {
+      return json({ error: "Schema is missing. Ensure you have const schema = { name, schema }." }, 500);
+    }
+
+    // Slim + normalize inputs (prevents huge token usage)
     const slimApps = apps.slice(0, 300).map(a => ({
       company: a["Company Name"] ?? a.company ?? "",
       role: a["Role Title"] ?? a.role ?? "",
@@ -59,7 +90,7 @@ export async function POST(request) {
       next_action: a["Next Action Date"] ?? a.next_action ?? "",
       recruiter: a["Recruiter Name"] ?? a.recruiter ?? "",
       recruiter_email: a["Recruiter Email"] ?? a.recruiter_email ?? "",
-      notes: String(a["Notes"] ?? a.notes ?? "").slice(0, 500),
+      notes: safeString_(a["Notes"] ?? a.notes, 500),
       interest: a["Interest Level (1–5)"] ?? a.interest ?? ""
     }));
 
@@ -70,7 +101,7 @@ export async function POST(request) {
       where_met: n["Where Met"] ?? "",
       last_contact: n["Last Contact Date"] ?? "",
       next_follow_up: n["Next Follow-up Date"] ?? "",
-      notes: String(n["Notes"] ?? "").slice(0, 500)
+      notes: safeString_(n["Notes"], 500)
     }));
 
     const slimInterviews = interviews.slice(0, 200).map(i => ({
@@ -79,65 +110,28 @@ export async function POST(request) {
       stage: i["Stage"] ?? "",
       date: i["Date"] ?? "",
       format: i["Format"] ?? "",
-      topics: String(i["Topics"] ?? "").slice(0, 300),
+      topics: safeString_(i["Topics"], 300),
       rating: i["Self Rating (1–5)"] ?? "",
       follow_up_sent: i["Follow-up Sent?"] ?? "",
-      notes: String(i["Notes"] ?? "").slice(0, 400)
+      notes: safeString_(i["Notes"], 400)
     }));
-
-    const ghostedDays = meta.ghosted_days_threshold ?? 14;
-
-    const schema = {
-      name: "internship_ai_recommendations",
-      schema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          summary: { type: "string" },
-          urgent_actions: { type: "array", items: { type: "string" } },
-          next_7_days_plan: { type: "array", items: { type: "string" } },
-          follow_ups: {
-            type: "array",
-            items: {
-              type: "object",
-              additionalProperties: false,
-              properties: {
-                company: { type: "string" },
-                suggested_date: { type: "string" },
-                reason: { type: "string" },
-                message_draft: { type: "string" }
-              },
-              required: ["company", "suggested_date", "reason", "message_draft"]
-            }
-          },
-          recruiter_questions: { type: "array", items: { type: "string" } },
-          strategy_insights: { type: "array", items: { type: "string" } },
-          interview_prep: { type: "array", items: { type: "string" } },
-          risk_flags: { type: "array", items: { type: "string" } }
-        },
-        required: [
-          "summary",
-          "urgent_actions",
-          "next_7_days_plan",
-          "follow_ups",
-          "recruiter_questions",
-          "strategy_insights",
-          "interview_prep",
-          "risk_flags"
-        ]
-      }
-    };
 
     const system = `
 You are an internship application AI coach.
-Given the user's applications, networking, and interview history,
-generate an actionable plan with follow-ups, outreach drafts, and insights.
+Given applications, networking, and interviews, produce:
+- urgent actions (next 72 hours)
+- next 7 days plan
+- follow-ups with message drafts
+- recruiter questions
+- strategy insights
+- interview prep plan
+- risk flags
 
 Rules:
-- Be concrete and time-oriented (use "today", "in 2 days", "this Friday" style).
-- Prefer high priority + submitted + no follow-up applications first.
-- Identify ghosted items: submitted > ${ghostedDays} days ago with no follow-up.
-- Output must match the JSON schema exactly.
+- Be specific and time-oriented.
+- Prioritize High priority + Submitted + No follow-up.
+- Treat apps as ghosted if submitted > ${ghostedDays} days ago and no follow-up.
+Return ONLY JSON matching the schema.
 `.trim();
 
     const user = {
@@ -148,33 +142,33 @@ Rules:
     };
 
     const response = await client.responses.create({
-  model: "gpt-4o-mini",
-  input: [
-    { role: "system", content: system },
-    { role: "user", content: JSON.stringify(user) }
-  ],
-  text: {
-    format: {
-      type: "json_schema",
-      name: schema.name,        // ✅ top-level name
-      schema: schema.schema,    // ✅ inner JSON Schema ONLY
-      strict: true
+      model: "gpt-4o-mini",
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: JSON.stringify(user) }
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: schemaName,
+          schema: innerSchema,
+          strict: true
+        }
+      }
+    });
+
+    const out = response.output_text;
+    let parsed;
+    try {
+      parsed = JSON.parse(out);
+    } catch (e) {
+      // If the model ever returns non-JSON, return it for debugging
+      return json({ error: "Model returned non-JSON output.", raw: out }, 500);
     }
-  }
-});
-
-// Responses API returns valid JSON as text
-const parsed = JSON.parse(response.output_text);
-
-
-const parsed = JSON.parse(response.output_text);
-
-
-// Responses API returns JSON as text in this mode
-const parsed = JSON.parse(response.output_text);
 
     return json(parsed, 200);
   } catch (err) {
-    return json({ error: String(err?.message || err) }, 500);
+    // Ensure we ALWAYS return JSON (so Apps Script shows the real error)
+    return json({ error: err?.message ? String(err.message) : String(err) }, 500);
   }
 }
