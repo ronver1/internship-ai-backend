@@ -156,12 +156,16 @@ Rules:
   text: {
     format: {
       type: "json_schema",
-      name: "internship_ai_recommendations",
-      schema: schema,   // IMPORTANT: this must be the raw JSON Schema object (type/properties/required...)
+      name: schema.name,        // ✅ top-level name
+      schema: schema.schema,    // ✅ inner JSON Schema ONLY
       strict: true
     }
   }
 });
+
+// Responses API returns valid JSON as text
+const parsed = JSON.parse(response.output_text);
+
 
 const parsed = JSON.parse(response.output_text);
 
