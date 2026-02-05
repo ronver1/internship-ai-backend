@@ -148,18 +148,21 @@ Rules:
     };
 
     const response = await client.responses.create({
-      model: "gpt-4.1-mini",
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: JSON.stringify(user) }
-      ],
-      response_format: { type: "json_schema", json_schema: schema }
-    });
+  model: "gpt-4o-mini",
+  input: [
+    { role: "system", content: system },
+    { role: "user", content: JSON.stringify(user) }
+  ],
+  text: {
+    format: {
+      type: "json_schema",
+      json_schema: schema
+    }
+  }
+});
 
-    // Responses API returns structured content; simplest is to grab output_text
-    // which should be the JSON string in this mode.
-    const out = response.output_text;
-    const parsed = JSON.parse(out);
+// Responses API returns JSON as text in this mode
+const parsed = JSON.parse(response.output_text);
 
     return json(parsed, 200);
   } catch (err) {
